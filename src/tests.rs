@@ -7,7 +7,9 @@ use crate::{
 };
 use alloc::vec::Vec;
 use p3_air::SymbolicExpressionExt;
-use p3_field::{Algebra, BasedVectorSpace, Field, PrimeCharacteristicRing, PrimeField64};
+#[cfg(feature = "keccak")]
+use p3_field::PrimeField64;
+use p3_field::{Algebra, BasedVectorSpace, Field, PrimeCharacteristicRing};
 use spongefish::{Permutation, Unit};
 use spongefish_circuit::{
     allocator::FieldVar,
@@ -16,6 +18,10 @@ use spongefish_circuit::{
 use spongefish_poseidon2::{BabyBearPoseidon2_16, KoalaBearPoseidon2_16};
 
 const TEST_LINEAR_WIDTH: usize = 1;
+
+#[cfg(feature = "keccak")]
+type RelationCase<B, const WIDTH: usize> =
+    ([RelationField<B>; WIDTH], Vec<(usize, RelationField<B>)>);
 
 #[cfg(feature = "keccak")]
 /// Source hashes generated via https://emn178.github.io/online-tools/keccak_256.html
@@ -136,32 +142,82 @@ where
 }
 
 #[cfg(feature = "keccak")]
-fn run_keccak256_preimage_proof_vector(message: &str, expected_digest_hex: &str) {
-    use crate::keccak::{KeccakF1600HashAir, KeccakF1600Permutation, KECCAK_WIDTH};
+fn keccak256_vector_cases<B>() -> Vec<RelationCase<B, 100>>
+where
+    B: StarkRelationBackend,
+    RelationField<B>: PrimeField64 + Field + Unit + PartialEq + Send + Sync,
+{
+    KECCAK256_PREIMAGE_VECTORS
+        .iter()
+        .map(|(message, expected_digest_hex)| {
+            let input = keccak256_single_block_input::<RelationField<B>>(message);
+            let expected_digest = decode_hex_32(expected_digest_hex);
+            let public_outputs = keccak256_public_outputs::<B>(expected_digest);
+            (input, public_outputs)
+        })
+        .collect()
+}
 
-    type B = BabyBearPoseidon2Backend;
-    let backend = B::default();
-    let hash = KeccakF1600HashAir::<RelationField<B>>::default();
-    let permutation = KeccakF1600Permutation::<RelationField<B>>::default();
-    let input = keccak256_single_block_input::<RelationField<B>>(message);
-    let expected_digest = decode_hex_32(expected_digest_hex);
-    let output = permutation.permute(&input);
-    assert_eq!(keccak256_digest_from_state(&output), expected_digest);
+#[cfg(feature = "keccak")]
+fn build_private_input_relation_instance_and_witness<
+    B,
+    P,
+    const WIDTH: usize,
+    const LIN_WIDTH: usize,
+>(
+    permutation: P,
+    cases: impl IntoIterator<Item = RelationCase<B, WIDTH>>,
+) -> (
+    PermutationInstanceBuilder<RelationField<B>, WIDTH>,
+    PermutationWitnessBuilder<P, WIDTH>,
+)
+where
+    B: StarkRelationBackend,
+    P: Permutation<WIDTH, U = RelationField<B>>,
+    RelationField<B>: Field + Unit + PartialEq + Send + Sync,
+{
+    let instance = PermutationInstanceBuilder::<RelationField<B>, WIDTH>::new();
+    let witness = PermutationWitnessBuilder::<P, WIDTH>::new(permutation);
 
-    let public_outputs = keccak256_public_outputs::<B>(expected_digest);
-    let (instance, witness) = build_relation_instance_and_witness::<
-        B,
-        _,
-        KECCAK_WIDTH,
-        TEST_LINEAR_WIDTH,
-    >(permutation, input, &public_outputs);
-    let proof = relation::prove::<B, _, _, KECCAK_WIDTH, TEST_LINEAR_WIDTH>(
-        &backend, &hash, &instance, &witness,
-    );
-    assert!(relation::verify::<B, _, KECCAK_WIDTH, TEST_LINEAR_WIDTH>(
-        &backend, &hash, &instance, &proof
-    )
-    .is_ok());
+    for (input, public_outputs) in cases {
+        let input_vars = instance.allocator().allocate_vars::<WIDTH>();
+        let output_vars = instance.allocate_permutation(&input_vars);
+        let output_vals = witness.allocate_permutation(&input);
+
+        instance.allocator().set_public_vars(
+            public_outputs.iter().map(|(idx, _)| output_vars[*idx]),
+            public_outputs.iter().map(|(_, val)| *val),
+        );
+
+        instance.add_equation(LinearEquation::new(
+            core::iter::once((
+                <RelationField<B> as PrimeCharacteristicRing>::ONE,
+                output_vars[0],
+            ))
+            .chain((1..LIN_WIDTH).map(|_| {
+                (
+                    <RelationField<B> as PrimeCharacteristicRing>::ZERO,
+                    FieldVar(0),
+                )
+            })),
+            output_vals[0],
+        ));
+        witness.add_equation(LinearEquation::new(
+            core::iter::once((
+                <RelationField<B> as PrimeCharacteristicRing>::ONE,
+                output_vals[0],
+            ))
+            .chain((1..LIN_WIDTH).map(|_| {
+                (
+                    <RelationField<B> as PrimeCharacteristicRing>::ZERO,
+                    <RelationField<B> as PrimeCharacteristicRing>::ZERO,
+                )
+            })),
+            output_vals[0],
+        ));
+    }
+
+    (instance, witness)
 }
 
 fn build_relation_instance_and_witness<B, P, const WIDTH: usize, const LIN_WIDTH: usize>(
@@ -327,11 +383,84 @@ fn keccak256_single_block_vectors_match_reference() {
 
 #[cfg(feature = "keccak")]
 #[test]
-#[ignore = "expensive Keccak-256 STARK preimage proofs"]
-fn keccak256_preimage_proofs_for_documented_vectors() {
-    for (message, expected_digest_hex) in KECCAK256_PREIMAGE_VECTORS {
-        run_keccak256_preimage_proof_vector(message, expected_digest_hex);
-    }
+fn keccak256_secret_preimage_relation_keeps_inputs_private() {
+    use crate::keccak::{KeccakF1600Permutation, KECCAK_WIDTH};
+
+    type B = BabyBearPoseidon2Backend;
+    let cases = keccak256_vector_cases::<B>();
+
+    let (instance, witness) =
+        build_private_input_relation_instance_and_witness::<B, _, KECCAK_WIDTH, TEST_LINEAR_WIDTH>(
+            KeccakF1600Permutation::<RelationField<B>>::default(),
+            vec![cases[0].clone()],
+        );
+
+    let public_vars = instance.public_vars();
+    assert_eq!(public_vars.len(), 1 + 16);
+    assert!(public_vars
+        .iter()
+        .all(|(var, _)| var.0 == 0 || var.0 > KECCAK_WIDTH));
+
+    let witness_trace = witness.trace();
+    let output = witness_trace.as_ref()[0].output;
+    assert_eq!(
+        keccak256_digest_from_state(&output),
+        decode_hex_32(KECCAK256_PREIMAGE_VECTORS[0].1)
+    );
+}
+
+#[cfg(feature = "keccak")]
+#[test]
+fn keccak256_secret_preimages_match_documented_vectors_in_one_proof() {
+    use crate::keccak::{KeccakF1600HashAir, KeccakF1600Permutation, KECCAK_WIDTH};
+
+    type B = BabyBearPoseidon2Backend;
+    let backend = B::default();
+    let hash = KeccakF1600HashAir::<RelationField<B>>::default();
+    let permutation = KeccakF1600Permutation::<RelationField<B>>::default();
+
+    let cases = keccak256_vector_cases::<B>();
+    let (instance, witness) =
+        build_private_input_relation_instance_and_witness::<B, _, KECCAK_WIDTH, TEST_LINEAR_WIDTH>(
+            permutation,
+            cases.clone(),
+        );
+
+    // Only the digest limbs should be public, not the 100-limb padded preimages.
+    assert_eq!(
+        instance.public_vars().len(),
+        1 + 16 * KECCAK256_PREIMAGE_VECTORS.len()
+    );
+
+    let proof = relation::prove::<B, _, _, KECCAK_WIDTH, TEST_LINEAR_WIDTH>(
+        &backend, &hash, &instance, &witness,
+    );
+    assert!(relation::verify::<B, _, KECCAK_WIDTH, TEST_LINEAR_WIDTH>(
+        &backend, &hash, &instance, &proof
+    )
+    .is_ok());
+
+    let mut bad_cases = cases;
+    bad_cases[0].1[0].1 += <RelationField<B> as PrimeCharacteristicRing>::ONE;
+    let (bad_instance, _) =
+        build_private_input_relation_instance_and_witness::<B, _, KECCAK_WIDTH, TEST_LINEAR_WIDTH>(
+            KeccakF1600Permutation::<RelationField<B>>::default(),
+            bad_cases,
+        );
+    assert!(relation::verify::<B, _, KECCAK_WIDTH, TEST_LINEAR_WIDTH>(
+        &backend,
+        &hash,
+        &bad_instance,
+        &proof
+    )
+    .is_err());
+
+    let mut bad_proof = proof;
+    bad_proof[0] ^= 0x01;
+    assert!(relation::verify::<B, _, KECCAK_WIDTH, TEST_LINEAR_WIDTH>(
+        &backend, &hash, &instance, &bad_proof
+    )
+    .is_err());
 }
 
 #[cfg(feature = "keccak")]

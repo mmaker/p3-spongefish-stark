@@ -3,11 +3,14 @@
 extern crate alloc;
 
 use p3_air::AirBuilder;
+use p3_field::PrimeCharacteristicRing;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_uni_stark::{StarkGenericConfig, Val};
 use spongefish::Permutation;
 use spongefish_circuit::permutation::PermutationWitnessBuilder;
 
+#[cfg(feature = "keccak")]
+pub mod keccak;
 pub mod poseidon2;
 pub mod relation;
 
@@ -36,6 +39,11 @@ pub trait HashInvocationAir<F, const WIDTH: usize>: Clone {
     /// Width of the main trace used by the inner hash AIR.
     fn main_width(&self) -> usize;
 
+    /// Number of AIR rows used to realize one logical hash invocation.
+    fn trace_rows_per_invocation(&self) -> usize {
+        1
+    }
+
     /// Evaluate the inner hash AIR constraints over the provided builder.
     fn eval<AB>(&self, builder: &mut AB)
     where
@@ -59,6 +67,16 @@ pub trait HashInvocationAir<F, const WIDTH: usize>: Clone {
     fn invocation<AB>(&self, frame: &Self::Frame<'_, AB::Var>) -> QueryAnswerPair<AB::Expr, WIDTH>
     where
         AB: AirBuilder<F = F>;
+
+    /// Selector for whether the current row should contribute to the outer
+    /// relation lookups. Single-row chips return `1`; multi-row chips can gate
+    /// lookups to their export/final row.
+    fn lookup_selector<AB>(&self, _frame: &Self::Frame<'_, AB::Var>) -> AB::Expr
+    where
+        AB: AirBuilder<F = F>,
+    {
+        AB::Expr::ONE
+    }
 }
 
 /// Backend configuration for the generic STARK relation layer.

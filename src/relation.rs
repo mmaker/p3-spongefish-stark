@@ -64,9 +64,8 @@ struct LinearConstraintCols<T, const LIN_WIDTH: usize> {
 #[repr(C)]
 struct LinearConstraintPreprocessedCols<T, const LIN_WIDTH: usize> {
     linear_vars: [T; LIN_WIDTH],
-    image_var: T,
+    image_value: T,
     linear_multiplicities: [T; LIN_WIDTH],
-    image_multiplicity: T,
 }
 
 impl<T, const WIDTH: usize> Borrow<LookupCols<T, WIDTH>> for [T] {
@@ -176,6 +175,7 @@ struct HashLookupAir<H, F, const WIDTH: usize, const LIN_WIDTH: usize> {
     hash: H,
     builder: PermutationInstanceBuilder<F, WIDTH>,
     linear_constraints: Option<LinearConstraintsInstance<F>>,
+    trace_len: usize,
 }
 
 #[derive(Clone)]
@@ -203,11 +203,13 @@ impl<H, F, const WIDTH: usize, const LIN_WIDTH: usize> HashLookupAir<H, F, WIDTH
         hash: H,
         builder: PermutationInstanceBuilder<F, WIDTH>,
         linear_constraints: LinearConstraintsInstance<F>,
+        trace_len: usize,
     ) -> Self {
         Self {
             hash,
             builder,
             linear_constraints: Some(linear_constraints),
+            trace_len,
         }
     }
 }
@@ -252,8 +254,9 @@ where
     RelationChallenge<B>: BasedVectorSpace<RelationField<B>>,
     SymbolicExpressionExt<RelationField<B>, RelationChallenge<B>>: Algebra<RelationChallenge<B>>,
 {
-    let target_len = target_len_with_linear(instance);
-    pad_witness_permutations(instance, witness, target_len);
+    let logical_target_len = target_len_with_linear(instance);
+    pad_witness_permutations(instance, witness, logical_target_len);
+    let target_len = hash_trace_target_len(hash, instance).max(logical_target_len);
     let (mut airs, traces) =
         generate_trace_rows_with_linear::<H, RelationField<B>, P, WIDTH, LIN_WIDTH>(
             hash, instance, witness,
@@ -292,8 +295,9 @@ where
     let config = backend.config(2024);
     let proof: BatchProof<B::Config> =
         postcard::from_bytes(proof_bytes).map_err(|_| VerificationError)?;
-    let target_len = target_len_with_linear(instance);
-    pad_instance_permutations(instance, target_len);
+    let logical_target_len = target_len_with_linear(instance);
+    pad_instance_permutations(instance, logical_target_len);
+    let target_len = hash_trace_target_len(hash, instance).max(logical_target_len);
     if let Some(&log_degree) = proof.degree_bits.first() {
         let proof_len = 1usize << log_degree.saturating_sub(config.is_zk());
         assert_eq!(target_len, proof_len);
@@ -308,6 +312,7 @@ where
             hash.clone(),
             instance.clone(),
             linear_constraints.clone(),
+            target_len,
         ))),
         GenericHashRelationAir::Public(PublicVarLookupAir::new(instance.clone(), target_len)),
         GenericHashRelationAir::Linear(
@@ -346,8 +351,9 @@ where
     validate_linear_constraints::<LIN_WIDTH, _, _>(&linear_constraints, "instance");
     validate_linear_constraints::<LIN_WIDTH, _, _>(&linear_witness, "witness");
 
-    let trace_len = target_len_with_linear(instance);
-    let trace = build_hash_lookup_trace(hash, witness);
+    let hash_trace = build_hash_lookup_trace(hash, witness);
+    let trace_len = hash_trace.height().max(target_len_with_linear(instance));
+    let trace = pad_dense_matrix_to_height(hash_trace, trace_len);
     let public_trace = build_public_lookup_main_trace::<F>(trace_len);
     let linear_trace = build_linear_constraints_trace::<F, LIN_WIDTH>(&linear_witness);
 
@@ -357,6 +363,7 @@ where
                 hash.clone(),
                 instance.clone(),
                 linear_constraints.clone(),
+                trace_len,
             ),
         )),
         GenericHashRelationAir::Public(PublicVarLookupAir::new(instance.clone(), trace_len)),
@@ -415,8 +422,10 @@ where
         let input_outputs = self.builder.constraints();
         let vars_count = self.builder.allocator().vars_count();
         let output_count = input_outputs.as_ref().len();
+        let rows_per_invocation = self.hash.trace_rows_per_invocation();
+        let unpadded_rows = output_count * rows_per_invocation;
         let mut ptrace = DenseMatrix::new(
-            vec![<F as PrimeCharacteristicRing>::ZERO; num_lookup_cols::<WIDTH>() * output_count],
+            vec![<F as PrimeCharacteristicRing>::ZERO; num_lookup_cols::<WIDTH>() * self.trace_len],
             num_lookup_cols::<WIDTH>(),
         );
 
@@ -439,12 +448,13 @@ where
             .map(|(_, output)| output.clone())
             .unwrap_or_else(|| vec![[0; WIDTH]; output_count]);
 
-        for (row_idx, column) in ptrace.rows_mut().enumerate() {
-            let pair = &input_outputs.as_ref()[row_idx];
-            let output_mult = output_multiplicities[row_idx];
-            let input_mult = input_multiplicities[row_idx];
-            let linear_input = linear_inputs[row_idx];
-            let linear_output = linear_outputs[row_idx];
+        for (row_idx, column) in ptrace.rows_mut().take(unpadded_rows).enumerate() {
+            let pair_idx = row_idx / rows_per_invocation;
+            let pair = &input_outputs.as_ref()[pair_idx];
+            let output_mult = output_multiplicities[pair_idx];
+            let input_mult = input_multiplicities[pair_idx];
+            let linear_input = linear_inputs[pair_idx];
+            let linear_output = linear_outputs[pair_idx];
             let lookup: &mut LookupCols<F, WIDTH> = column.borrow_mut();
             lookup.input_public = pair
                 .input
@@ -549,11 +559,16 @@ where
     fn eval(&self, builder: &mut AB) {
         let main = builder.main();
         let local: &LinearConstraintCols<_, LIN_WIDTH> = main.current_slice().borrow();
+        let preprocessed = builder.preprocessed();
+        let prep: &LinearConstraintPreprocessedCols<_, LIN_WIDTH> =
+            preprocessed.current_slice().borrow();
+        let image_value = prep.image_value;
         let mut sum = AB::Expr::ZERO;
         for i in 0..LIN_WIDTH {
             sum += local.linear_coefficients[i] * local.linear_combination[i];
         }
         builder.assert_eq(sum, local.image);
+        builder.assert_eq(local.image, image_value);
     }
 }
 
@@ -606,11 +621,13 @@ where
         let row = main.row_slice(0).expect("symbolic row should exist");
         let frame = self.hash.row_frame(&row);
         let invocation = self.hash.invocation::<SymbolicAirBuilder<F>>(&frame);
+        let selector = self.hash.lookup_selector::<SymbolicAirBuilder<F>>(&frame);
         let preprocessed = symbolic.preprocessed();
         let lookup_row = preprocessed
             .row_slice(0)
             .expect("symbolic row should exist");
         let lookup_column: &LookupCols<_, WIDTH> = (*lookup_row).borrow();
+        type Expr<F> = <SymbolicAirBuilder<F> as AirBuilder>::Expr;
 
         let mut lookups = Vec::new();
         for i in 0..WIDTH {
@@ -624,6 +641,12 @@ where
             let output_public = lookup_column.output_public[i];
             let input_linear = lookup_column.input_linear_constraints[i];
             let output_linear = lookup_column.output_linear_constraints[i];
+            let input_multiplicity: Expr<F> = input_multiplicity.into();
+            let output_multiplicity: Expr<F> = output_multiplicity.into();
+            let input_public: Expr<F> = input_public.into();
+            let output_public: Expr<F> = output_public.into();
+            let input_linear: Expr<F> = input_linear.into();
+            let output_linear: Expr<F> = output_linear.into();
 
             lookups.push(Lookup::new(
                 Kind::Global(IO_LOOKUP_NAME.to_string()),
@@ -632,8 +655,8 @@ where
                     vec![output_var.into(), output.clone()],
                 ],
                 vec![
-                    Direction::Send.multiplicity(input_multiplicity.into()),
-                    Direction::Receive.multiplicity(output_multiplicity.into()),
+                    Direction::Send.multiplicity(selector.clone() * input_multiplicity),
+                    Direction::Receive.multiplicity(selector.clone() * output_multiplicity),
                 ],
                 vec![3 * i],
             ));
@@ -644,8 +667,8 @@ where
                     vec![input_var.into(), input.clone()],
                 ],
                 vec![
-                    Direction::Send.multiplicity(output_public.into()),
-                    Direction::Send.multiplicity(input_public.into()),
+                    Direction::Send.multiplicity(selector.clone() * output_public),
+                    Direction::Send.multiplicity(selector.clone() * input_public),
                 ],
                 vec![3 * i + 1],
             ));
@@ -656,8 +679,8 @@ where
                     vec![output_var.into(), output],
                 ],
                 vec![
-                    Direction::Send.multiplicity(input_linear.into()),
-                    Direction::Send.multiplicity(output_linear.into()),
+                    Direction::Send.multiplicity(selector.clone() * input_linear),
+                    Direction::Send.multiplicity(selector.clone() * output_linear),
                 ],
                 vec![3 * i + 2],
             ));
@@ -710,7 +733,7 @@ where
             .expect("symbolic row should exist");
         let pre_cols: &LinearConstraintPreprocessedCols<_, LIN_WIDTH> = (*pre_row).borrow();
 
-        let mut entries = Vec::with_capacity(LIN_WIDTH + 1);
+        let mut entries = Vec::with_capacity(LIN_WIDTH);
         for i in 0..LIN_WIDTH {
             entries.push((
                 vec![
@@ -721,11 +744,6 @@ where
                 Direction::Receive,
             ));
         }
-        entries.push((
-            vec![pre_cols.image_var.into(), main_cols.image.into()],
-            pre_cols.image_multiplicity.into(),
-            Direction::Receive,
-        ));
         let (element_exprs, multiplicities_exprs): (Vec<_>, Vec<_>) = entries
             .into_iter()
             .map(|(elements, multiplicity, direction)| {
@@ -811,9 +829,8 @@ where
         let row = &mut values[offset..offset + width];
         let column: &mut LinearConstraintPreprocessedCols<F, LIN_WIDTH> = row.borrow_mut();
         column.linear_vars = linear_vars.map(|var| F::from_usize(var.0));
-        column.image_var = <F as PrimeCharacteristicRing>::ZERO;
+        column.image_value = equation.image;
         column.linear_multiplicities = linear_multiplicities;
-        column.image_multiplicity = <F as PrimeCharacteristicRing>::ZERO;
     }
 
     DenseMatrix::new(values, width)
@@ -990,6 +1007,19 @@ where
         .len()
         .max(instance.public_vars().len())
         .max(instance.linear_constraints().as_ref().len())
+        .next_power_of_two()
+        .max(1)
+}
+
+fn hash_trace_target_len<H, F, const WIDTH: usize>(
+    hash: &H,
+    instance: &PermutationInstanceBuilder<F, WIDTH>,
+) -> usize
+where
+    H: HashInvocationAir<F, WIDTH>,
+    F: Field + Unit + PartialEq,
+{
+    (instance.constraints().as_ref().len() * hash.trace_rows_per_invocation())
         .next_power_of_two()
         .max(1)
 }

@@ -441,6 +441,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "p3-keccak-air"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e79e07d8e9c9a988a6d39eb5adb4601edbe6bee9fa7724bbd8175d69e2b63eb7"
+dependencies = [
+ "p3-air",
+ "p3-field",
+ "p3-matrix",
+ "p3-maybe-rayon",
+ "p3-util",
+ "rand 0.10.0",
+ "tracing",
+]
+
+[[package]]
 name = "p3-koala-bear"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -888,6 +903,7 @@ dependencies = [
 name = "spongefish-stark"
 version = "1.0.0-rc1"
 dependencies = [
+ "keccak",
  "p3-air",
  "p3-baby-bear",
  "p3-batch-stark",
@@ -896,6 +912,7 @@ dependencies = [
  "p3-dft",
  "p3-field",
  "p3-fri",
+ "p3-keccak-air",
  "p3-koala-bear",
  "p3-lookup",
  "p3-matrix",
